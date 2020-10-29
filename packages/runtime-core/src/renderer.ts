@@ -56,7 +56,11 @@ import {
   queueEffectWithSuspense,
   SuspenseImpl
 } from './components/Suspense'
-import { TeleportImpl, TeleportVNode } from './components/Teleport'
+import {
+  isTeleportDisabled,
+  TeleportImpl,
+  TeleportVNode
+} from './components/Teleport'
 import { isKeepAlive, KeepAliveContext } from './components/KeepAlive'
 import { registerHMR, unregisterHMR, isHmrUpdating } from './hmr'
 import {
@@ -885,7 +889,7 @@ function baseCreateRenderer(
       invokeDirectiveHook(n2, n1, parentComponent, 'beforeUpdate')
     }
 
-    if (__DEV__ && isHmrUpdating) {
+    if (__DEV__ && (__BROWSER__ || __TEST__) && isHmrUpdating) {
       // HMR updated, force full diff
       patchFlag = 0
       optimized = false
@@ -986,7 +990,12 @@ function baseCreateRenderer(
         parentSuspense,
         areChildrenSVG
       )
-      if (__DEV__ && parentComponent && parentComponent.type.__hmrId) {
+      if (
+        __DEV__ &&
+        (__BROWSER__ || __TEST__) &&
+        parentComponent &&
+        parentComponent.type.__hmrId
+      ) {
         traverseStaticChildren(n1, n2)
       }
     } else if (!optimized) {
@@ -1061,6 +1070,7 @@ function baseCreateRenderer(
   ) => {
     if (oldProps !== newProps) {
       for (const key in newProps) {
+        // empty string is not valid prop
         if (isReservedProp(key)) continue
         const next = newProps[key]
         const prev = oldProps[key]
@@ -1238,7 +1248,7 @@ function baseCreateRenderer(
       parentSuspense
     ))
 
-    if (__DEV__ && instance.type.__hmrId) {
+    if (__DEV__ && (__BROWSER__ || __TEST__) && instance.type.__hmrId) {
       registerHMR(instance)
     }
 
@@ -1425,11 +1435,11 @@ function baseCreateRenderer(
         }
 
         if (next) {
+          next.el = vnode.el
           updateComponentPreRender(instance, next, optimized)
         } else {
           next = vnode
         }
-        next.el = vnode.el
 
         // beforeUpdate hook
         if (bu) {
@@ -1451,11 +1461,6 @@ function baseCreateRenderer(
         const prevTree = instance.subTree
         instance.subTree = nextTree
 
-        // reset refs
-        // only needed if previous patch had refs
-        if (instance.refs !== EMPTY_OBJ) {
-          instance.refs = {}
-        }
         if (__DEV__) {
           startMeasure(instance, `patch`)
         }
@@ -2033,12 +2038,20 @@ function baseCreateRenderer(
           false,
           true
         )
-      } else if (!optimized && shapeFlag & ShapeFlags.ARRAY_CHILDREN) {
+      } else if (
+        (type === Fragment &&
+          (patchFlag & PatchFlags.KEYED_FRAGMENT ||
+            patchFlag & PatchFlags.UNKEYED_FRAGMENT)) ||
+        (!optimized && shapeFlag & ShapeFlags.ARRAY_CHILDREN)
+      ) {
         unmountChildren(children as VNode[], parentComponent, parentSuspense)
       }
 
-      // an unmounted teleport should always remove its children
-      if (shapeFlag & ShapeFlags.TELEPORT) {
+      // an unmounted teleport should always remove its children if not disabled
+      if (
+        shapeFlag & ShapeFlags.TELEPORT &&
+        (doRemove || !isTeleportDisabled(vnode.props))
+      ) {
         ;(vnode.type as typeof TeleportImpl).remove(vnode, internals)
       }
 
@@ -2109,7 +2122,7 @@ function baseCreateRenderer(
     parentSuspense: SuspenseBoundary | null,
     doRemove?: boolean
   ) => {
-    if (__DEV__ && instance.type.__hmrId) {
+    if (__DEV__ && (__BROWSER__ || __TEST__) && instance.type.__hmrId) {
       unregisterHMR(instance)
     }
 
@@ -2183,39 +2196,6 @@ function baseCreateRenderer(
     return hostNextSibling((vnode.anchor || vnode.el)!)
   }
 
-  /**
-   * #1156
-   * When a component is HMR-enabled, we need to make sure that all static nodes
-   * inside a block also inherit the DOM element from the previous tree so that
-   * HMR updates (which are full updates) can retrieve the element for patching.
-   *
-   * #2080
-   * Inside keyed `template` fragment static children, if a fragment is moved,
-   * the children will always moved so that need inherit el form previous nodes
-   * to ensure correct moved position.
-   */
-  const traverseStaticChildren = (n1: VNode, n2: VNode, shallow = false) => {
-    const ch1 = n1.children
-    const ch2 = n2.children
-    if (isArray(ch1) && isArray(ch2)) {
-      for (let i = 0; i < ch1.length; i++) {
-        // this is only called in the optimized path so array children are
-        // guaranteed to be vnodes
-        const c1 = ch1[i] as VNode
-        const c2 = (ch2[i] = cloneIfMounted(ch2[i] as VNode))
-        if (c2.shapeFlag & ShapeFlags.ELEMENT && !c2.dynamicChildren) {
-          if (c2.patchFlag <= 0 || c2.patchFlag === PatchFlags.HYDRATE_EVENTS) {
-            c2.el = c1.el
-          }
-          if (!shallow) traverseStaticChildren(c1, c2)
-        }
-        if (__DEV__ && c2.type === Comment) {
-          c2.el = c1.el
-        }
-      }
-    }
-  }
-
   const render: RootRenderFunction = (vnode, container) => {
     if (vnode == null) {
       if (container._vnode) {
@@ -2267,6 +2247,42 @@ export function invokeVNodeHook(
     vnode,
     prevVNode
   ])
+}
+
+/**
+ * #1156
+ * When a component is HMR-enabled, we need to make sure that all static nodes
+ * inside a block also inherit the DOM element from the previous tree so that
+ * HMR updates (which are full updates) can retrieve the element for patching.
+ *
+ * #2080
+ * Inside keyed `template` fragment static children, if a fragment is moved,
+ * the children will always moved so that need inherit el form previous nodes
+ * to ensure correct moved position.
+ */
+export function traverseStaticChildren(n1: VNode, n2: VNode, shallow = false) {
+  const ch1 = n1.children
+  const ch2 = n2.children
+  if (isArray(ch1) && isArray(ch2)) {
+    for (let i = 0; i < ch1.length; i++) {
+      // this is only called in the optimized path so array children are
+      // guaranteed to be vnodes
+      const c1 = ch1[i] as VNode
+      let c2 = ch2[i] as VNode
+      if (c2.shapeFlag & ShapeFlags.ELEMENT && !c2.dynamicChildren) {
+        if (c2.patchFlag <= 0 || c2.patchFlag === PatchFlags.HYDRATE_EVENTS) {
+          c2 = ch2[i] = cloneIfMounted(ch2[i] as VNode)
+          c2.el = c1.el
+        }
+        if (!shallow) traverseStaticChildren(c1, c2)
+      }
+      // also inherit for comment nodes, but not placeholders (e.g. v-if which
+      // would have received .el during block patch)
+      if (__DEV__ && c2.type === Comment && !c2.el) {
+        c2.el = c1.el
+      }
+    }
+  }
 }
 
 // https://en.wikipedia.org/wiki/Longest_increasing_subsequence
